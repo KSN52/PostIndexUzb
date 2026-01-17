@@ -1,1 +1,382 @@
-test
+#!/usr/bin/env python3
+"""
+Simple OSM postal index parser for Uzbekistan.
+
+Parses .osm, .osm.gz, and .osm.bz2 files and writes CSV or JSON output.
+"""
+from __future__ import annotations
+
+import argparse
+import bz2
+import csv
+import gzip
+import json
+import re
+import sys
+import xml.etree.ElementTree as ET
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Set
+
+POSTCODE_SPLIT_RE = re.compile(r"[;,/|]")
+COUNTRY_SPLIT_RE = re.compile(r"[;,/|]")
+SPACE_RE = re.compile(r"\s+")
+
+NAME_KEYS = (
+    "name",
+    "name:ru",
+    "name:uz",
+    "name:en",
+    "official_name",
+    "short_name",
+)
+ADDRESS_CITY_KEYS = (
+    "addr:city",
+    "addr:town",
+    "addr:village",
+    "addr:hamlet",
+    "addr:place",
+)
+COUNTRY_KEYS = (
+    "addr:country",
+    "addr:country_code",
+    "is_in:country",
+    "country",
+    "ISO3166-1",
+    "ISO3166-1:alpha2",
+    "ISO3166-1:alpha3",
+)
+COUNTRY_ALIASES = {
+    "UZBEKISTAN": "UZ",
+    "REPUBLIC OF UZBEKISTAN": "UZ",
+    "UZB": "UZ",
+}
+DEFAULT_PLACE_TYPES = {"city", "town"}
+DEFAULT_ADMIN_LEVELS = {"6", "7", "8"}
+
+
+@dataclass
+class CityRecord:
+    postcodes: Set[str] = field(default_factory=set)
+    sources: Set[str] = field(default_factory=set)
+
+
+@contextmanager
+def open_osm_input(path: str):
+    if path == "-":
+        yield sys.stdin.buffer
+        return
+    if path.endswith(".gz"):
+        with gzip.open(path, "rb") as handle:
+            yield handle
+        return
+    if path.endswith(".bz2"):
+        with bz2.open(path, "rb") as handle:
+            yield handle
+        return
+    with open(path, "rb") as handle:
+        yield handle
+
+
+def parse_csv_set(value: str, lower: bool = True) -> Set[str]:
+    result: Set[str] = set()
+    for part in value.split(","):
+        cleaned = part.strip()
+        if not cleaned:
+            continue
+        result.add(cleaned.lower() if lower else cleaned)
+    return result
+
+
+def normalize_whitespace(value: str) -> str:
+    return " ".join(value.strip().split())
+
+
+def is_postcode_key(key: str) -> bool:
+    lowered = key.lower()
+    return "postcode" in lowered or "postal_code" in lowered
+
+
+def split_postcodes(value: str) -> Iterable[str]:
+    for part in POSTCODE_SPLIT_RE.split(value):
+        cleaned = SPACE_RE.sub("", part.strip())
+        if cleaned:
+            yield cleaned
+
+
+def extract_postcodes(tags: Dict[str, str], min_length: int) -> Set[str]:
+    results: Set[str] = set()
+    for key, value in tags.items():
+        if not value:
+            continue
+        if not is_postcode_key(key):
+            continue
+        for code in split_postcodes(value):
+            if len(code) >= min_length:
+                results.add(code)
+    return results
+
+
+def split_country_values(value: str) -> Iterable[str]:
+    for part in COUNTRY_SPLIT_RE.split(value):
+        cleaned = part.strip()
+        if cleaned:
+            yield cleaned
+
+
+def normalize_country_value(value: str) -> str:
+    return value.strip().upper()
+
+
+def country_matches(tags: Dict[str, str], country_code: str, strict: bool) -> bool:
+    if not country_code:
+        return True
+    target = normalize_country_value(country_code)
+    raw_values: List[str] = []
+    for key in COUNTRY_KEYS:
+        value = tags.get(key)
+        if value:
+            raw_values.append(value)
+    if not raw_values:
+        return not strict
+    for raw in raw_values:
+        for part in split_country_values(raw):
+            normalized = normalize_country_value(part)
+            mapped = COUNTRY_ALIASES.get(normalized, normalized)
+            if mapped == target:
+                return True
+            if target in normalized:
+                return True
+    return False
+
+
+def pick_name(tags: Dict[str, str]) -> str | None:
+    for key in NAME_KEYS:
+        value = tags.get(key)
+        if value:
+            return normalize_whitespace(value)
+    return None
+
+
+def get_address_city(tags: Dict[str, str]) -> str | None:
+    for key in ADDRESS_CITY_KEYS:
+        value = tags.get(key)
+        if value:
+            return normalize_whitespace(value)
+    return None
+
+
+def is_settlement(
+    tags: Dict[str, str],
+    place_types: Set[str],
+    include_boundaries: bool,
+    admin_levels: Set[str],
+) -> bool:
+    place = tags.get("place")
+    if place and place.lower() in place_types:
+        return True
+    if include_boundaries and tags.get("boundary") == "administrative":
+        level = tags.get("admin_level", "").strip()
+        if level in admin_levels:
+            return True
+    return False
+
+
+def extract_tags(element: ET.Element) -> Dict[str, str]:
+    return {tag.get("k"): tag.get("v") for tag in element.iterfind("tag")}
+
+
+def add_city(
+    index: Dict[str, CityRecord],
+    city_name: str | None,
+    postcodes: Set[str],
+    source: str,
+) -> None:
+    if not city_name or not postcodes:
+        return
+    record = index.setdefault(city_name, CityRecord())
+    record.postcodes.update(postcodes)
+    record.sources.add(source)
+
+
+def parse_osm(
+    input_path: str,
+    place_types: Set[str],
+    admin_levels: Set[str],
+    country: str,
+    strict_country: bool,
+    include_addresses: bool,
+    include_boundaries: bool,
+    min_postcode_length: int,
+) -> Dict[str, CityRecord]:
+    index: Dict[str, CityRecord] = {}
+    with open_osm_input(input_path) as handle:
+        context = ET.iterparse(handle, events=("start", "end"))
+        _, root = next(context)
+        for event, element in context:
+            if event != "end":
+                continue
+            if element.tag not in {"node", "way", "relation"}:
+                continue
+            tags = extract_tags(element)
+            if not tags:
+                element.clear()
+                continue
+            if not country_matches(tags, country, strict_country):
+                element.clear()
+                continue
+            postcodes = extract_postcodes(tags, min_postcode_length)
+            if postcodes:
+                if is_settlement(tags, place_types, include_boundaries, admin_levels):
+                    name = pick_name(tags)
+                    if name:
+                        source = (
+                            "boundary"
+                            if tags.get("boundary") == "administrative"
+                            else "place"
+                        )
+                        add_city(index, name, postcodes, source)
+                if include_addresses:
+                    addr_city = get_address_city(tags)
+                    if addr_city:
+                        add_city(index, addr_city, postcodes, "address")
+            element.clear()
+            root.clear()
+    return index
+
+
+def build_records(index: Dict[str, CityRecord]) -> List[Dict[str, object]]:
+    records: List[Dict[str, object]] = []
+    for city, record in index.items():
+        records.append(
+            {
+                "city": city,
+                "postcodes": sorted(record.postcodes),
+                "sources": sorted(record.sources),
+            }
+        )
+    records.sort(key=lambda item: item["city"].casefold())
+    return records
+
+
+def write_csv(records: List[Dict[str, object]], output_path: str) -> None:
+    with open(output_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["city", "postcodes", "sources"])
+        writer.writeheader()
+        for record in records:
+            writer.writerow(
+                {
+                    "city": record["city"],
+                    "postcodes": ";".join(record["postcodes"]),
+                    "sources": ";".join(record["sources"]),
+                }
+            )
+
+
+def write_json(records: List[Dict[str, object]], output_path: str) -> None:
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(records, handle, ensure_ascii=False, indent=2)
+
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Simple OSM postal index parser for Uzbekistan."
+    )
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="Path to .osm/.osm.gz/.osm.bz2 file or '-' for stdin.",
+    )
+    parser.add_argument(
+        "--output",
+        default="uzbekistan_postcodes.csv",
+        help="Output file path.",
+    )
+    parser.add_argument("--format", choices=["csv", "json"], default="csv")
+    parser.add_argument(
+        "--country",
+        default="UZ",
+        help="Country filter (ISO code or name).",
+    )
+    parser.add_argument(
+        "--strict-country",
+        action="store_true",
+        help="Require country tag to be present and match.",
+    )
+    parser.add_argument(
+        "--place-types",
+        default="city,town",
+        help="Comma-separated OSM place types.",
+    )
+    parser.add_argument(
+        "--admin-levels",
+        default="6,7,8",
+        help="Comma-separated admin levels for boundaries.",
+    )
+    parser.add_argument(
+        "--min-postcode-length",
+        type=int,
+        default=3,
+        help="Ignore postcodes shorter than this.",
+    )
+    parser.add_argument(
+        "--no-boundaries",
+        dest="include_boundaries",
+        action="store_false",
+        help="Disable boundary-based extraction.",
+    )
+    parser.add_argument(
+        "--no-addresses",
+        dest="include_addresses",
+        action="store_false",
+        help="Disable address-based extraction.",
+    )
+    parser.add_argument(
+        "--stats",
+        action="store_true",
+        help="Print summary to stderr.",
+    )
+    parser.set_defaults(include_boundaries=True, include_addresses=True)
+    return parser.parse_args(argv)
+
+
+def main(argv: List[str]) -> int:
+    args = parse_args(argv)
+    place_types = parse_csv_set(args.place_types, lower=True) or set(DEFAULT_PLACE_TYPES)
+    admin_levels = (
+        parse_csv_set(args.admin_levels, lower=False) or set(DEFAULT_ADMIN_LEVELS)
+    )
+    try:
+        index = parse_osm(
+            input_path=args.input,
+            place_types=place_types,
+            admin_levels=admin_levels,
+            country=args.country,
+            strict_country=args.strict_country,
+            include_addresses=args.include_addresses,
+            include_boundaries=args.include_boundaries,
+            min_postcode_length=args.min_postcode_length,
+        )
+    except FileNotFoundError:
+        print(f"Input file not found: {args.input}", file=sys.stderr)
+        return 1
+    except ET.ParseError as exc:
+        print(f"Failed to parse OSM XML: {exc}", file=sys.stderr)
+        return 1
+
+    records = build_records(index)
+    if args.format == "csv":
+        write_csv(records, args.output)
+    else:
+        write_json(records, args.output)
+
+    if args.stats:
+        postcode_total = sum(len(item["postcodes"]) for item in records)
+        print(f"Cities: {len(records)}", file=sys.stderr)
+        print(f"Postcodes: {postcode_total}", file=sys.stderr)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
