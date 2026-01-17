@@ -19,11 +19,11 @@
 
 ## Использование
 - CSV по умолчанию:
-  - `python "Main py" --input uzbekistan.osm --output uz_postcodes.csv --stats`
+  - `python3 "Main py" --input uzbekistan.osm --output uz_postcodes.csv --stats`
 - JSON:
-  - `python "Main py" --input uzbekistan.osm --output uz_postcodes.json --format json`
+  - `python3 "Main py" --input uzbekistan.osm --output uz_postcodes.json --format json`
 - Отключить адресный источник:
-  - `python "Main py" --input uzbekistan.osm --no-addresses`
+  - `python3 "Main py" --input uzbekistan.osm --no-addresses`
 
 ## Зависимости
 - Внешние зависимости отсутствуют.
